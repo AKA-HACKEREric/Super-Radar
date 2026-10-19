@@ -6,6 +6,7 @@ import os
 import random
 import string
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -86,6 +87,7 @@ def get_gps_location():
                 return lat, lon, "GPS"
     except Exception:
         pass
+    _gps_cache["loading"] = False   # BUG FIX: allow retry on next call
     return None, None, None
 
 DEVICE_TTL_SECONDS = 12
@@ -131,6 +133,16 @@ wifi_lock       = threading.Lock()
 
 radio_channels  = {}
 radio_lock      = threading.Lock()
+
+# GPS satellite data (from USB GPS receiver / NMEA)
+gps_satellites  = {}           # key: "GPS_03"  val: {constellation, prn, elevation, azimuth, snr, seen}
+gps_sat_lock    = threading.Lock()
+gps_hw_status   = {"connected": False, "port": None, "error": None}
+
+# LAN host discovery
+net_hosts       = {}           # ip -> {ip, mac, vendor, hostname, is_local, first_seen, last_seen}
+net_lock        = threading.Lock()
+net_status      = {"scanning": False, "subnet": None, "total_scanned": 0, "error": None}
 
 current_mode    = "BLE"
 mode_lock       = threading.Lock()
@@ -2259,6 +2271,258 @@ def radio_scan_worker():
             log_event(f"Radio scan worker error: {e}", mode="RADIO")
             time.sleep(5)
 
+# =================== GPS Satellite Scanning ===================
+
+CONSTELLATION_PREFIXES = {
+    "GP": "GPS", "GL": "GLO", "GA": "GAL", "GB": "BDS", "GN": "GPS",
+}
+
+def _try_pyserial():
+    """Import pyserial; return (serial_module, list_ports_module) or (None, None)."""
+    try:
+        import serial
+        import serial.tools.list_ports
+        return serial, serial.tools.list_ports
+    except ImportError:
+        return None, None
+
+def _find_gps_serial_port():
+    """Return (port_device, hint) or (None, reason_code)."""
+    _serial, _ports_mod = _try_pyserial()
+    if _serial is None:
+        return None, "NEED_PYSERIAL"
+    ports = list(_ports_mod.comports())
+    if not ports:
+        return None, "NO_PORT"
+    GPS_KEYWORDS = ["gps", "u-blox", "ublox", "neo", "sirf", "nmea", "gnss",
+                    "pa6h", "vk162", "bn220", "l86", "atgm336h"]
+    for port in ports:
+        desc = (port.description + " " + port.hwid).lower()
+        if any(kw in desc for kw in GPS_KEYWORDS):
+            return port.device, "GPS_MATCH"
+    return ports[0].device, "FIRST_PORT"   # fallback — try anyway
+
+def _parse_gsv_sentence(line, constellation):
+    """Parse one $xxGSV NMEA sentence into gps_satellites dict."""
+    parts = line.split(',')
+    if len(parts) < 4:
+        return
+    idx = 4
+    while idx + 3 <= len(parts):
+        prn_s  = parts[idx]
+        elev_s = parts[idx + 1]
+        azim_s = parts[idx + 2]
+        snr_s  = parts[idx + 3].split('*')[0].strip()
+        idx += 4
+        if not prn_s:
+            continue
+        try:
+            prn  = int(prn_s)
+            elev = int(elev_s) if elev_s else 0
+            azim = int(azim_s) if azim_s else 0
+            snr  = int(snr_s)  if snr_s  else 0
+            key  = f"{constellation}_{prn:02d}"
+            with gps_sat_lock:
+                gps_satellites[key] = {
+                    "constellation": constellation,
+                    "prn":           prn,
+                    "elevation":     elev,
+                    "azimuth":       azim,
+                    "snr":           snr,
+                    "seen":          time.monotonic(),
+                }
+        except (ValueError, TypeError):
+            pass
+
+def scan_gps_satellites():
+    """Try to read NMEA GSV sentences from a connected USB GPS receiver."""
+    _serial, _ = _try_pyserial()
+    if _serial is None:
+        gps_hw_status.update({"connected": False, "port": None, "error": "NEED_PYSERIAL"})
+        return
+
+    port, hint = _find_gps_serial_port()
+    if port is None:
+        gps_hw_status.update({"connected": False, "port": None, "error": "NO_PORT"})
+        return
+
+    for baud in (9600, 38400, 115200, 4800):
+        try:
+            ser = _serial.Serial(port, baudrate=baud, timeout=2)
+            found_nmea = False
+            for _ in range(80):
+                raw = ser.readline()
+                try:
+                    line = raw.decode('ascii', errors='ignore').strip()
+                except Exception:
+                    continue
+                if not line.startswith('$'):
+                    continue
+                prefix = line[1:3]
+                if 'GSV' in line and prefix in CONSTELLATION_PREFIXES:
+                    _parse_gsv_sentence(line, CONSTELLATION_PREFIXES[prefix])
+                    found_nmea = True
+                elif 'GGA' in line or 'RMC' in line:
+                    found_nmea = True   # NMEA confirmed even if no GSV yet
+            ser.close()
+            if found_nmea:
+                gps_hw_status.update({"connected": True, "port": port, "error": None})
+                return
+        except Exception:
+            pass
+
+    gps_hw_status.update({"connected": False, "port": port,
+                           "error": "NO_NMEA"})
+
+def gps_sat_worker():
+    """Background GPS satellite scanner — polls every 5 s."""
+    while True:
+        try:
+            scan_gps_satellites()
+            now = time.monotonic()
+            with gps_sat_lock:
+                stale = [k for k, v in gps_satellites.items() if now - v["seen"] > 30]
+                for k in stale:
+                    del gps_satellites[k]
+        except Exception as e:
+            log_event(f"GPS sat scan error: {e}", mode="GPS")
+        time.sleep(5)
+
+# =================== LAN / Network Scanner ===================
+
+def _get_local_ip():
+    """Return this machine's LAN IP by probing a UDP socket."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+def _resolve_hostname_quick(ip):
+    """Reverse-DNS lookup with a short timeout."""
+    try:
+        import socket
+        socket.setdefaulttimeout(0.5)
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
+
+def _mac_to_vendor(mac):
+    """Quick OUI lookup using the existing DEV_BOARD_OUI_TYPES / LOGITECH_OUIS dicts."""
+    if not mac:
+        return "Unknown"
+    oui = mac[:8].upper()
+    if oui in DEV_BOARD_OUI_TYPES:
+        return DEV_BOARD_OUI_TYPES[oui].split('|')[0]
+    if oui in LOGITECH_OUIS:
+        return "Logitech"
+    return "Unknown"
+
+def _parse_arp(output, subnet):
+    """Parse `arp -a` output (Windows / Linux / macOS) → {ip: mac}."""
+    import re
+    ip_re  = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+    mac_re = re.compile(
+        r'([0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}'
+        r'[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2})'
+    )
+    found = {}
+    for line in output.splitlines():
+        ip_m  = ip_re.search(line)
+        mac_m = mac_re.search(line)
+        if not ip_m or not mac_m:
+            continue
+        ip  = ip_m.group(1)
+        mac = mac_m.group(1).upper().replace('-', ':')
+        if not ip.startswith(subnet) or mac == 'FF:FF:FF:FF:FF:FF':
+            continue
+        last = int(ip.split('.')[-1])
+        if last in (0, 255):
+            continue
+        found[ip] = mac
+    return found
+
+def scan_net_hosts():
+    """Concurrent ping-sweep + ARP-read for LAN host discovery."""
+    local_ip = _get_local_ip()
+    if not local_ip:
+        net_status.update({"error": "NO_NETWORK", "scanning": False})
+        return
+
+    p      = local_ip.split('.')
+    subnet = f"{p[0]}.{p[1]}.{p[2]}"
+    net_status.update({"subnet": f"{subnet}.0/24", "scanning": True, "error": None})
+
+    try:
+        procs = []
+        for i in range(1, 255):
+            ip = f"{subnet}.{i}"
+            if os.name == 'nt':
+                proc = subprocess.Popen(
+                    ["ping", "-n", "1", "-w", "150", ip],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            else:
+                proc = subprocess.Popen(
+                    ["ping", "-c", "1", "-W", "1", ip],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            procs.append(proc)
+
+        deadline = time.monotonic() + 5.0
+        for proc in procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        arp_cmd = ["arp", "-a"] if os.name == 'nt' else ["arp", "-n"]
+        arp_out = _run_command(arp_cmd)
+        if arp_out:
+            now  = time.monotonic()
+            hits = _parse_arp(arp_out, subnet)
+            with net_lock:
+                for ip, mac in hits.items():
+                    vendor   = _mac_to_vendor(mac)
+                    hostname = _resolve_hostname_quick(ip)
+                    is_local = (ip == local_ip)
+                    if ip not in net_hosts:
+                        net_hosts[ip] = {
+                            "ip":         ip,
+                            "mac":        mac,
+                            "vendor":     vendor,
+                            "hostname":   hostname,
+                            "is_local":   is_local,
+                            "first_seen": now,
+                            "last_seen":  now,
+                        }
+                        log_event(f"NET  NEW  {ip}  {hostname or vendor}", mode="NET")
+                    else:
+                        net_hosts[ip]["last_seen"] = now
+                stale = [k for k, v in net_hosts.items() if now - v["last_seen"] > 120]
+                for k in stale:
+                    del net_hosts[k]
+        net_status["total_scanned"] = 254
+    except Exception as exc:
+        net_status["error"] = str(exc)
+    finally:
+        net_status["scanning"] = False
+
+def net_scan_worker():
+    """Background LAN scanner — runs every 60 s."""
+    while True:
+        try:
+            scan_net_hosts()
+        except Exception as e:
+            log_event(f"Net scan worker error: {e}", mode="NET")
+        time.sleep(60)
+
 # =================== Radar UI Class ===================
 class Radar:
     def __init__(self):
@@ -2314,11 +2578,13 @@ class Radar:
         self.display_reboot_until = 0.0
         self.last_mode_switch_time = time.monotonic() - self.mode_cooldown_seconds
         self.mode_options = [
-            ("BLE", "BLE Radar"),
-            ("WIFI", "Wi-Fi Networks"),
-            ("HEAT", "Heatmap"),
-            ("TIME", "Timeline"),
-            ("RADIO", "Radio Scanner")
+            ("BLE",   "BLE Radar"),
+            ("WIFI",  "Wi-Fi Networks"),
+            ("HEAT",  "Heatmap"),
+            ("TIME",  "Timeline"),
+            ("RADIO", "Radio Scanner"),
+            ("GPS",   "GPS Sky View"),
+            ("NET",   "LAN Scanner"),
         ]
         self.mode_menu_open = False
 
@@ -3505,6 +3771,245 @@ class Radar:
 
             y += 20
 
+    # ──────────────── GPS Satellite Sky View ────────────────
+
+    def draw_gps_sky(self, w, h, cx, cy, max_r):
+        """Polar sky plot of visible GPS/GNSS satellites (azimuth × elevation)."""
+        CONST_COLORS = {
+            "GPS": COL_SWEEP,    # green
+            "GLO": "#4ab8ff",    # blue
+            "GAL": "#ff9d4a",    # orange
+            "BDS": "#df4aff",    # purple
+        }
+
+        # ── compact status header (top-left) ──
+        now_str = datetime.now().strftime('%H:%M:%S')
+        with gps_sat_lock:
+            sats = list(gps_satellites.values())
+        tracked = sum(1 for s in sats if s["snr"] > 0)
+
+        self.canvas.create_text(16, 16, anchor="nw",
+            text=f"TIME     {now_str}",
+            fill=COL_DIM_RING, font=("Consolas", 9))
+        self.canvas.create_text(16, 31, anchor="nw",
+            text=f"SAT VIEW {len(sats)} in view / {tracked} tracked",
+            fill=COL_DIM_RING, font=("Consolas", 9))
+
+        err  = gps_hw_status.get("error")
+        port = gps_hw_status.get("port") or "—"
+        ok   = gps_hw_status.get("connected", False)
+
+        HW_MSGS = {
+            "NEED_PYSERIAL": "⚠  pip install pyserial  →  then plug in your USB GPS receiver",
+            "NO_PORT":       "⚠  No USB GPS receiver detected — plug one in (u-blox, PA6H, BN220…)",
+            "NO_NMEA":       f"⚠  Port {port} found but no NMEA stream — check USB cable / baud rate",
+        }
+        if err:
+            hw_text  = HW_MSGS.get(err, f"⚠  GPS error: {err}")
+            hw_color = COL_WARN
+        elif ok:
+            hw_text  = f"✓  GPS receiver active on {port}"
+            hw_color = COL_SWEEP
+        else:
+            hw_text  = "Searching for USB GPS hardware..."
+            hw_color = COL_DIM_RING
+
+        self.canvas.create_text(16, 50, anchor="nw",
+            text=hw_text, fill=hw_color, font=("Consolas", 9))
+        self.canvas.create_text(16, 68, anchor="nw",
+            text="F11 Fullscreen | ESC Exit",
+            fill=COL_DIM_RING, font=("Consolas", 9))
+
+        # ── elevation rings: 60°, 30°, 0° (horizon) ──
+        # mapping: elev 90° → r=0 (zenith/center), elev 0° → r=max_r (horizon/edge)
+        for elev_deg, label in ((30, "60°"), (60, "30°"), (90, "0°")):
+            r = int(max_r * elev_deg / 90)
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                   outline=COL_GRID_DIM, width=1)
+            self.canvas.create_text(cx+r+4, cy, text=label,
+                                   fill=COL_DIM_RING, font=("Consolas", 7), anchor="w")
+
+        # horizon ring (brighter)
+        self.canvas.create_oval(cx-max_r, cy-max_r, cx+max_r, cy+max_r,
+                               outline=COL_GRID, width=1)
+
+        # ── N/E/S/W ticks and labels ──
+        for azim_deg, label in ((0,"N"), (90,"E"), (180,"S"), (270,"W")):
+            rad = math.radians(azim_deg - 90)
+            x1 = cx + math.cos(rad) * (max_r - 6)
+            y1 = cy + math.sin(rad) * (max_r - 6)
+            x2 = cx + math.cos(rad) * (max_r + 6)
+            y2 = cy + math.sin(rad) * (max_r + 6)
+            self.canvas.create_line(x1, y1, x2, y2, fill=COL_GRID)
+            lx = cx + math.cos(rad) * (max_r + 16)
+            ly = cy + math.sin(rad) * (max_r + 16)
+            self.canvas.create_text(lx, ly, text=label,
+                                   fill=COL_LABEL, font=("Consolas", 9, "bold"))
+
+        # ── dashed crosshair ──
+        for angle in (0, 90):
+            rad = math.radians(angle)
+            self.canvas.create_line(
+                cx - math.cos(rad)*max_r, cy - math.sin(rad)*max_r,
+                cx + math.cos(rad)*max_r, cy + math.sin(rad)*max_r,
+                fill=COL_GRID_DIM, width=1, dash=(2, 6))
+
+        # ── satellite dots ──
+        if not sats:
+            placeholder = ("Acquiring satellites..." if ok
+                           else "No GPS hardware — see status above")
+            self.canvas.create_text(cx, cy, text=placeholder,
+                                   fill=COL_DIM_RING, font=("Consolas", 11))
+        else:
+            for sat in sats:
+                elev  = max(0, min(90, sat["elevation"]))
+                azim  = sat["azimuth"]
+                snr   = sat["snr"]
+                const = sat["constellation"]
+
+                r   = max_r * (1.0 - elev / 90.0)
+                rad = math.radians(azim - 90)
+                sx  = cx + math.cos(rad) * r
+                sy  = cy + math.sin(rad) * r
+
+                # Color: by SNR level
+                if snr == 0:
+                    dot_col = COL_DIM_RING
+                elif snr < 20:
+                    dot_col = COL_ALERT
+                elif snr < 35:
+                    dot_col = COL_WARN
+                else:
+                    dot_col = CONST_COLORS.get(const, COL_SWEEP)
+
+                dot_r = max(4, min(9, 3 + snr // 8))   # size scales with SNR
+
+                if snr >= 35:                            # glow ring for strong lock
+                    gr = dot_r + 4
+                    self.canvas.create_oval(sx-gr, sy-gr, sx+gr, sy+gr,
+                                           outline=dot_col, fill="", width=1)
+
+                self.canvas.create_oval(sx-dot_r, sy-dot_r, sx+dot_r, sy+dot_r,
+                                       fill=dot_col, outline=COL_BG, width=1)
+                lbl = f"{const[0]}{sat['prn']:02d}"
+                self.canvas.create_text(sx, sy, text=lbl,
+                                       fill=COL_BG, font=("Consolas", 6, "bold"))
+
+        # ── constellation legend (bottom-left) ──
+        lx, ly = 16, h - 115
+        self.canvas.create_text(lx, ly, anchor="nw",
+            text="CONSTELLATION", fill=COL_DIM_RING, font=("Consolas", 8, "bold"))
+        ly += 13
+        for name, color in CONST_COLORS.items():
+            self.canvas.create_rectangle(lx, ly+1, lx+8, ly+9, fill=color, outline="")
+            self.canvas.create_text(lx+12, ly, anchor="nw", text=name,
+                                   fill=color, font=("Consolas", 8))
+            ly += 12
+
+        # ── SNR quality legend (bottom-left, offset right) ──
+        rx, ry = 100, h - 115
+        self.canvas.create_text(rx, ry, anchor="nw",
+            text="SNR (dBHz)", fill=COL_DIM_RING, font=("Consolas", 8, "bold"))
+        ry += 13
+        for label, color in (
+            ("≥35  strong",  COL_SWEEP),
+            ("20-34 medium", COL_WARN),
+            ("<20  weak",    COL_ALERT),
+            ("—    no lock", COL_DIM_RING),
+        ):
+            self.canvas.create_rectangle(rx, ry+1, rx+8, ry+9, fill=color, outline="")
+            self.canvas.create_text(rx+12, ry, anchor="nw", text=label,
+                                   fill=color, font=("Consolas", 8))
+            ry += 12
+
+    # ──────────────── LAN / Network Scanner ────────────────
+
+    def draw_net_scan(self, w, h):
+        """Draw LAN host discovery in table format (ARP-based)."""
+        top      = 160
+        scanning = net_status.get("scanning", False)
+        subnet   = net_status.get("subnet") or "Detecting..."
+        suffix   = "  [SCANNING…]" if scanning else ""
+
+        self.canvas.create_text(16, top, anchor="nw",
+            text=f"LAN Host Scanner — {subnet}{suffix}",
+            fill=COL_LABEL, font=("Consolas", 11, "bold"))
+
+        err = net_status.get("error")
+        if err:
+            err_msgs = {
+                "NO_NETWORK": "⚠  No network interface detected",
+            }
+            self.canvas.create_text(16, top+20, anchor="nw",
+                text=err_msgs.get(err, f"⚠  Error: {err}"),
+                fill=COL_WARN, font=("Consolas", 9))
+            return
+
+        self.canvas.create_line(16, top+30, w-50, top+30, fill=COL_GRID_DIM)
+
+        with net_lock:
+            hosts = sorted(net_hosts.values(),
+                           key=lambda x: [int(n) for n in x["ip"].split('.')])
+
+        COL_IP     = 16
+        COL_HOST   = 145
+        COL_MAC    = 310
+        COL_VENDOR = 470
+
+        y = top + 38
+        for col, label in ((COL_IP,    "IP ADDRESS"),
+                           (COL_HOST,  "HOSTNAME"),
+                           (COL_MAC,   "MAC"),
+                           (COL_VENDOR,"VENDOR / STATUS")):
+            self.canvas.create_text(col, y, anchor="nw", text=label,
+                                   fill=COL_DIM_RING, font=("Consolas", 8, "bold"))
+        y += 14
+        self.canvas.create_line(16, y-2, w-50, y-2, fill=COL_GRID_DIM)
+
+        if not hosts:
+            msg = ("Scanning network… first run takes ~10 s" if scanning
+                   else "No hosts found yet — next scan in ~60 s")
+            self.canvas.create_text(16, y+6, anchor="nw",
+                text=msg, fill=COL_DIM_RING, font=("Consolas", 9))
+        else:
+            for i, host in enumerate(hosts):
+                if y > h - 60:
+                    self.canvas.create_text(16, y, anchor="nw",
+                        text=f"… and {len(hosts)-i} more",
+                        fill=COL_DIM_RING, font=("Consolas", 8))
+                    break
+
+                is_local = host.get("is_local", False)
+                age      = time.monotonic() - host.get("last_seen", time.monotonic())
+                fresh    = age < 120
+
+                row_col  = COL_LABEL if is_local else (COL_TEXT if fresh else COL_DIM_RING)
+                hostname = host.get("hostname") or "—"
+                vendor   = host.get("vendor")   or "Unknown"
+
+                if is_local:
+                    status = "THIS DEVICE"; scol = COL_SWEEP
+                elif fresh:
+                    status = "ACTIVE";      scol = COL_HIT
+                else:
+                    status = "STALE";       scol = COL_DIM_RING
+
+                self.canvas.create_text(COL_IP,     y, anchor="nw",
+                    text=host["ip"],        fill=row_col,     font=("Consolas", 9))
+                self.canvas.create_text(COL_HOST,   y, anchor="nw",
+                    text=hostname[:20],     fill=COL_TEXT,    font=("Consolas", 8))
+                self.canvas.create_text(COL_MAC,    y, anchor="nw",
+                    text=host["mac"],       fill=COL_DIM_RING,font=("Consolas", 8))
+                self.canvas.create_text(COL_VENDOR, y, anchor="nw",
+                    text=f"{vendor[:14]}  {status}",
+                                       fill=scol,        font=("Consolas", 8))
+                y += 18
+
+        total = len(hosts)
+        self.canvas.create_text(16, h-38, anchor="nw",
+            text=f"Hosts: {total}  |  Subnet: {subnet}  |  Refreshes every 60 s",
+            fill=COL_DIM_RING, font=("Consolas", 8))
+
     def show_warning_popup(self, warn_info):
         """顯示警告彈窗（包含驗證詳情）"""
         warning = warn_info['warning']
@@ -3617,6 +4122,25 @@ class Radar:
             self.draw_radio(w, h)
             visible = 0
             status_msg = f"Radio channel scanner active (simulated). [Radio Scanner Mode]"
+        elif current_mode_val == "GPS":
+            self.draw_gps_sky(w, h, cx, cy, max_r)
+            visible = 0
+            with gps_sat_lock:
+                n_sats = len(gps_satellites)
+            tracked = sum(1 for s in gps_satellites.values() if s["snr"] > 0)
+            if gps_hw_status.get("error"):
+                status_msg = f"GPS: {gps_hw_status['error']} — see instructions on screen. [GPS Sky View]"
+            else:
+                status_msg = f"GPS Sky View — {n_sats} satellites in view, {tracked} tracked. [GPS Sky View]"
+        elif current_mode_val == "NET":
+            self.draw_info_panel(0, cx, cy, 0, 0)
+            self.draw_net_scan(w, h)
+            visible = 0
+            with net_lock:
+                n_hosts = len(net_hosts)
+            scanning = net_status.get("scanning", False)
+            status_msg = (f"LAN Scanner — scanning… [Net Scanner Mode]" if scanning
+                          else f"LAN Scanner — {n_hosts} host(s) found. [Net Scanner Mode]")
         else:
             visible = 0
             status_msg = "Unknown mode"
@@ -3703,9 +4227,11 @@ def main():
     scan_start_time = time.monotonic()
 
     threading.Thread(target=cmd_boot_animation, daemon=True).start()
-    threading.Thread(target=ble_scan_worker, daemon=True).start()
-    threading.Thread(target=wifi_scan_worker, daemon=True).start()
+    threading.Thread(target=ble_scan_worker,   daemon=True).start()
+    threading.Thread(target=wifi_scan_worker,  daemon=True).start()
     threading.Thread(target=radio_scan_worker, daemon=True).start()
+    threading.Thread(target=gps_sat_worker,    daemon=True).start()
+    threading.Thread(target=net_scan_worker,   daemon=True).start()
     Radar().run()
 
 
